@@ -37,7 +37,30 @@
 // for use by the kernel and user pages
 // from physical address 0x80000000 to PHYSTOP.
 #define KERNBASE 0x80000000L
-#define PHYSTOP (KERNBASE + 128*1024*1024)
+#define PHYSTOP (KERNBASE + 6*1024*1024)
+
+// ---- PA4: disk-backed swap layout ----
+// The real disk layout is:
+//   blocks [0 .. SWAP_FS_SIZE-1]       : xv6 filesystem  (untouched)
+//   blocks [SWAP_FS_SIZE .. end]       : 4 simulated disk regions
+//
+// Simulated disk d, position p  ->  physical block = SWAP_FS_SIZE + d*SWAP_SIM_DISK_BLOCKS + p
+
+#define SWAP_FS_SIZE          2000   // filesystem occupies blocks 0..1999
+#define SWAP_NDISKS           4      // number of simulated disks
+#define SWAP_MAX_SLOTS        4096   // maximum number of swap slots
+#define SWAP_BLOCKS_PER_SLOT  4      // PGSIZE/BSIZE = 4096/1024
+#define SWAP_SIM_DISK_BLOCKS  4096   // blocks allocated per simulated disk region
+#define SWAP_ROTATIONAL_DELAY 10     // constant latency added to every request
+
+// RAID modes
+#define RAID_MODE_0  0   // striping  — slot s → disk s%4, pos (s/4)*SWAP_BLOCKS_PER_SLOT
+#define RAID_MODE_1  1   // mirroring — write to disk 0 and disk 1
+#define RAID_MODE_5  2   // distributed parity — 3 data + 1 parity per stripe of 4
+
+// Disk scheduling policies
+#define DISK_SCHED_FCFS  0
+#define DISK_SCHED_SSTF  1
 
 // map the trampoline page to the highest address,
 // in both user and kernel space.

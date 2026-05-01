@@ -2,6 +2,13 @@
 
 struct stat;
 
+struct mlfqinfo {
+  int level;
+  int ticks[4];
+  int times_scheduled;
+  int total_syscalls;
+};
+
 // system calls
 int fork(void);
 int exit(int) __attribute__((noreturn));
@@ -24,6 +31,14 @@ int getpid(void);
 char* sys_sbrk(int,int);
 int pause(int);
 int uptime(void);
+int hello(void);
+int getpid2(void);
+int getppid(void);
+int getnumchild(void);
+int getsyscount(void);
+int getchildsyscount(int);
+int getlevel(void);
+int getmlfqinfo(int pid, struct mlfqinfo *info);
 
 // ulib.c
 int stat(const char*, struct stat*);
@@ -47,3 +62,22 @@ void printf(const char*, ...) __attribute__ ((format (printf, 1, 2)));
 // umalloc.c
 void* malloc(uint);
 void free(void*);
+
+struct vmstats {
+  int page_faults;
+  int pages_evicted;
+  int pages_swapped_in;
+  int pages_swapped_out;
+  int resident_pages;
+};
+
+struct diskstats {
+  int disk_reads;
+  int disk_writes;
+  int avg_disk_latency;
+};
+
+int getvmstats(int pid, struct vmstats *info);
+int setdisksched(int policy);
+int setraidmode(int mode);
+int getdiskstats(struct diskstats *info);

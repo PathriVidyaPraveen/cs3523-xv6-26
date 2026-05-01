@@ -6,6 +6,13 @@
 #include "proc.h"
 #include "defs.h"
 
+#define NQUEUE 4
+int quantum[NQUEUE] = {2,4,8,16}; // time quantum per level
+#define BOOST_INTERVAL 128 // global priority boost interval
+uint global_ticks = 0; // global counter to trigger boost (tracks total timer tcks since boost)
+
+
+
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -124,6 +131,25 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  // initialize MLFQ fields
+  p->level = 0; // starting at highest priority
+  p->ticks_in_level = 0;
+  for(int i=0;i< NQUEUE;i++){
+    p->ticks_total[i] = 0;
+  }
+  p->times_scheduled = 0;
+  p->slice_start_syscount = 0;
+
+  p->syscount = 0;
+
+  p->page_faults = 0;
+p->pages_evicted = 0;
+p->pages_swapped_in = 0;
+p->pages_swapped_out = 0;
+p->resident_pages = 0;
+
+p->disk_reads  = 0;
+  p->disk_writes = 0;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -268,16 +294,45 @@ kfork(void)
     return -1;
   }
 
+  np->page_faults = 0;
+  np->pages_evicted = 0;
+  np->pages_swapped_in = 0;
+  np->pages_swapped_out = 0;
+  np->resident_pages = 0;
+  np->disk_reads  = 0;
+  np->disk_writes = 0;
+
   // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz, np) < 0){
     freeproc(np);
     release(&np->lock);
     return -1;
   }
   np->sz = p->sz;
 
+  // acquire(&frame_table_lock);
+  // for(uint64 a = 0; a < np->sz; a += PGSIZE){
+  //   pte_t *pte = walk(np->pagetable, a, 0);
+  //   if(pte && (*pte & PTE_V)){
+  //     uint64 pa = PTE2PA(*pte);
+  //     int fidx = (pa - KERNBASE) / PGSIZE;
+  //     if(ft[fidx].in_use) {
+  //       ft[fidx].owner = np;
+  //       ft[fidx].va = a;
+  //       ft[fidx].ref_bit = 1;
+  //       np->resident_pages++;
+  //     }
+  //   }
+  // }
+  // release(&frame_table_lock);
+
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
+//   np->page_faults = 0;
+// np->pages_evicted = 0;
+// np->pages_swapped_in = 0;
+// np->pages_swapped_out = 0;
+// np->resident_pages = 0;
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
@@ -421,47 +476,60 @@ kwait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
+
+
 void
 scheduler(void)
 {
-  struct proc *p;
   struct cpu *c = mycpu();
-
   c->proc = 0;
+  static int last_idx[NQUEUE] = {0}; // track last-run position per level
+
   for(;;){
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
     intr_on();
     intr_off();
-
     int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
-      }
-      release(&p->lock);
+    for(int level = 0; level < NQUEUE && !found; level++){
+      int start = last_idx[level];
+      int i = start;
+      do {
+        struct proc *p = &proc[i];
+        i = (i + 1) % NPROC;
+        acquire(&p->lock);
+        if(p->state == RUNNABLE && p->level == level){
+          p->state = RUNNING;
+          c->proc = p;
+          p->times_scheduled++;
+          p->ticks_in_level = 0;
+          p->slice_start_syscount = p->syscount;
+          last_idx[level] = (int)(p - proc); // remember where we stopped
+          swtch(&c->context, &p->context);
+          c->proc = 0;
+          found = 1;
+          release(&p->lock);
+          break;
+        }
+        release(&p->lock);
+      } while(i != start);
     }
-    if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
+    if(!found)
       asm volatile("wfi");
-    }
   }
 }
+void
+mlfq_boost(void)
+{
+  struct proc *p;
 
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->state == RUNNABLE || p->state == RUNNING){
+      p->level = 0;
+      p->ticks_in_level = 0;  // reset so it gets a fresh quantum at level 0
+    }
+    release(&p->lock);
+  }
+}
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores
 // intena because intena is a property of this
@@ -687,4 +755,54 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+int
+getvmstats_helper(int pid, uint64 stat_addr)
+{
+  struct proc *p;
+  struct vmstats local;
+  int found = 0;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+
+    if(p->pid == pid && p->state != UNUSED && p->state != ZOMBIE){
+      local.page_faults       = p->page_faults;
+      local.pages_evicted     = p->pages_evicted;
+      local.pages_swapped_in  = p->pages_swapped_in;
+      local.pages_swapped_out = p->pages_swapped_out;
+      local.resident_pages    = p->resident_pages;
+      
+      found = 1;
+      release(&p->lock);
+      break; 
+    }
+    release(&p->lock);
+  }
+
+  if(found){
+    struct proc *caller = myproc(); // MUST use caller's pagetable
+    return copyout(caller->pagetable, stat_addr, (char *)&local, sizeof(local));
+  }
+
+  return -1; // pid not found
+}
+
+
+int
+getdiskstats_helper(uint64 stat_addr)
+{
+  struct diskstats local;
+  int reads   = get_disk_reads();
+  int writes  = get_disk_writes();
+  int latency = get_disk_latency();
+  int ops     = reads + writes;
+
+  local.disk_reads       = reads;
+  local.disk_writes      = writes;
+  local.avg_disk_latency = (ops > 0) ? (latency / ops) : 0;
+
+  struct proc *caller = myproc();
+  return copyout(caller->pagetable, stat_addr, (char *)&local, sizeof(local));
 }

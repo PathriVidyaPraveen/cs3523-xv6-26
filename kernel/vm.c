@@ -7,7 +7,8 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "fs.h"
-
+// Forward declaration — defined later in this file
+static uint64 vmswap(pagetable_t pagetable, uint64 va);
 /*
  * the kernel's page table.
  */
@@ -201,8 +202,15 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
       continue;   
-    if((*pte & PTE_V) == 0)  // has physical page been allocated?
-      continue;
+if((*pte & PTE_V) == 0) {
+      // If it's not valid, check if it is in swap!
+      if(*pte & PTE_S){
+        int swap_idx = GET_SWAP_IDX(*pte);
+        disk_swap_free(swap_idx); 
+        *pte = 0; // MUST explicitly zero the PTE here
+      }
+      continue; 
+    }
     if(do_free){
       uint64 pa = PTE2PA(*pte);
       kfree((void*)pa);
@@ -294,7 +302,7 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
 int
-uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+uvmcopy(pagetable_t old, pagetable_t new, uint64 sz, struct proc *np) // ADDED struct proc *np
 {
   pte_t *pte;
   uint64 pa, i;
@@ -304,8 +312,35 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       continue;   // page table entry hasn't been allocated
-    if((*pte & PTE_V) == 0)
-      continue;   // physical page hasn't been allocated
+    
+    if((*pte & PTE_V) == 0) {
+      if(*pte & PTE_S){
+        // Parent has a swapped out page. Bring it into a new physical page for child.
+        int swap_idx = GET_SWAP_IDX(*pte);
+        if((mem = kalloc()) == 0)
+          goto err;
+        
+        disk_swap_read((uint64)mem, swap_idx); 
+        
+        flags = (PTE_FLAGS(*pte) & ~PTE_S) | PTE_V; // Restore flags, add Valid bit
+        if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+          kfree(mem);
+          goto err;
+        }
+
+        // -- NEW: Register child page immediately! --
+        acquire(&frame_table_lock);
+        int fidx = ((uint64)mem - KERNBASE) / PGSIZE;
+        ft[fidx].in_use = 1;
+        ft[fidx].owner = np;
+        ft[fidx].va = i;
+        ft[fidx].ref_bit = 1;
+        np->resident_pages++;
+        release(&frame_table_lock);
+      }
+      continue; // Skip standard unallocated lazy pages
+    }
+    
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
@@ -315,6 +350,16 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       kfree(mem);
       goto err;
     }
+
+    // -- NEW: Register child page immediately! --
+    acquire(&frame_table_lock);
+    int fidx = ((uint64)mem - KERNBASE) / PGSIZE;
+    ft[fidx].in_use = 1;
+    ft[fidx].owner = np;
+    ft[fidx].va = i;
+    ft[fidx].ref_bit = 1;
+    np->resident_pages++;
+    release(&frame_table_lock);
   }
   return 0;
 
@@ -351,11 +396,16 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
       return -1;
   
     pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
-        return -1;
-      }
-    }
+if(pa0 == 0) {
+  // Try swap-in first, then lazy allocation
+  pte_t *pte = walk(pagetable, va0, 0);
+  if(pte && (*pte & PTE_S))
+    pa0 = vmswap(pagetable, va0);
+  else
+    pa0 = vmfault(pagetable, va0, 0);
+  if(pa0 == 0)
+    return -1;
+}
 
     pte = walk(pagetable, va0, 0);
     // forbid copyout over read-only user text pages.
@@ -385,11 +435,15 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
     pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
-        return -1;
-      }
-    }
+if(pa0 == 0) {
+  pte_t *pte = walk(pagetable, va0, 0);
+  if(pte && (*pte & PTE_S))
+    pa0 = vmswap(pagetable, va0);
+  else
+    pa0 = vmfault(pagetable, va0, 0);
+  if(pa0 == 0)
+    return -1;
+}
     n = PGSIZE - (srcva - va0);
     if(n > len)
       n = len;
@@ -449,6 +503,28 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 // that was lazily allocated in sys_sbrk().
 // returns 0 if va is invalid or already mapped, or if
 // out of physical memory, and physical address if successful.
+// uint64
+// vmfault(pagetable_t pagetable, uint64 va, int read)
+// {
+//   uint64 mem;
+//   struct proc *p = myproc();
+
+//   if (va >= p->sz)
+//     return 0;
+//   va = PGROUNDDOWN(va);
+//   if(ismapped(pagetable, va)) {
+//     return 0;
+//   }
+//   mem = (uint64) kalloc();
+//   if(mem == 0)
+//     return 0;
+//   memset((void *) mem, 0, PGSIZE);
+//   if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
+//     kfree((void *)mem);
+//     return 0;
+//   }
+//   return mem;
+// }
 uint64
 vmfault(pagetable_t pagetable, uint64 va, int read)
 {
@@ -458,9 +534,9 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   if (va >= p->sz)
     return 0;
   va = PGROUNDDOWN(va);
-  if(ismapped(pagetable, va)) {
+  if(ismapped(pagetable, va))
     return 0;
-  }
+
   mem = (uint64) kalloc();
   if(mem == 0)
     return 0;
@@ -469,9 +545,21 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
     kfree((void *)mem);
     return 0;
   }
+
+  // Register in frame table so Clock can evict this page
+  acquire(&frame_table_lock);
+  int fidx = ((uint64)mem - KERNBASE) / PGSIZE;
+  ft[fidx].in_use  = 1;
+  ft[fidx].owner   = p;
+  ft[fidx].va      = va;
+  ft[fidx].ref_bit = 1;
+  release(&frame_table_lock);
+
+  p->page_faults++;
+  p->resident_pages++;
+
   return mem;
 }
-
 int
 ismapped(pagetable_t pagetable, uint64 va)
 {
@@ -483,4 +571,39 @@ ismapped(pagetable_t pagetable, uint64 va)
     return 1;
   }
   return 0;
+}
+// Handle swap-in for a virtual address whose page is swapped out.
+// Returns physical address on success, 0 on failure.
+static uint64
+vmswap(pagetable_t pagetable, uint64 va)
+{
+  struct proc *p = myproc();
+  pte_t *pte = walk(pagetable, va, 0);
+  if(pte == 0 || !(*pte & PTE_S))
+    return 0;
+
+  int idx = GET_SWAP_IDX(*pte);
+  char *mem = kalloc();
+  if(mem == 0)
+    return 0;
+
+  disk_swap_in((uint64)mem, idx);  // reads data and frees the swap slot
+
+  // Restore PTE: clear PTE_S, set PTE_V, write physical address
+  *pte = ((*pte & 0x3FF) & ~PTE_S) | PTE_V | PA2PTE(mem);
+  *pte |= PTE_A;
+  sfence_vma();
+
+  acquire(&frame_table_lock);
+  int fidx = ((uint64)mem - KERNBASE) / PGSIZE;
+  ft[fidx].in_use  = 1;
+  ft[fidx].owner   = p;
+  ft[fidx].va      = va;
+  ft[fidx].ref_bit = 1;
+  release(&frame_table_lock);
+
+  p->pages_swapped_in++;
+  p->resident_pages++;
+
+  return (uint64)mem;
 }

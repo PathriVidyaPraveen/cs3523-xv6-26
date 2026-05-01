@@ -8,7 +8,7 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
-
+#include "frame.h"
 // bio.c
 void            binit(void);
 struct buf*     bread(uint, uint);
@@ -158,7 +158,7 @@ int             mappages(pagetable_t, uint64, uint64, uint64, int);
 pagetable_t     uvmcreate(void);
 uint64          uvmalloc(pagetable_t, uint64, uint64, int);
 uint64          uvmdealloc(pagetable_t, uint64, uint64);
-int             uvmcopy(pagetable_t, pagetable_t, uint64);
+int uvmcopy(pagetable_t, pagetable_t, uint64, struct proc*);
 void            uvmfree(pagetable_t, uint64);
 void            uvmunmap(pagetable_t, uint64, uint64, int);
 void            uvmclear(pagetable_t, uint64);
@@ -183,3 +183,38 @@ void            virtio_disk_intr(void);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+
+uint64 sys_getlevel(void);
+uint64 sys_getmlfqinfo(void);
+
+// swap functions
+// int swap_out(uint64 pa);
+// void swap_in(uint64 pa, int idx);
+// int getvmstats_helper(int pid, uint64 stat_addr);
+// frame table externs
+
+struct frame_entry;
+extern struct frame_entry ft[];
+extern struct spinlock frame_table_lock;
+
+// swap functions
+// int swap_out(uint64 pa);
+// void swap_in(uint64 pa, int idx);
+// void swap_free(int idx);              // ADD THIS
+// void swap_read(uint64 pa, int idx);   // ADD THIS
+
+// swap_disk.c — disk-backed swap (PA4)
+void            swap_disk_init(void);
+int             disk_swap_out(uint64 pa);
+void            disk_swap_in(uint64 pa, int slot);
+void            disk_swap_read(uint64 pa, int slot);
+void            disk_swap_free(int slot);
+int             setdisksched_impl(int policy);
+int             setraidmode_impl(int mode);
+int             get_disk_reads(void);
+int             get_disk_writes(void);
+int             get_disk_latency(void);
+
+// proc.c helpers
+int             getvmstats_helper(int pid, uint64 stat_addr);
+int             getdiskstats_helper(uint64 stat_addr);
